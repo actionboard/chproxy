@@ -294,8 +294,8 @@ func loadConfig() (*config.Config, error) {
 // a configuration parameter value that is used in proxy initialization
 // changed
 func proxyConfigChanged(cfgCp *config.ConnectionPool, rp *reverseProxy) bool {
-	return cfgCp.MaxIdleConns != proxy.maxIdleConns ||
-		cfgCp.MaxIdleConnsPerHost != proxy.maxIdleConnsPerHost
+	return cfgCp.MaxIdleConns != rp.maxIdleConns ||
+		cfgCp.MaxIdleConnsPerHost != rp.maxIdleConnsPerHost
 }
 
 func applyConfig(cfg *config.Config) error {

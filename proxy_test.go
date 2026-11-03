@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"fmt"
 	"hash/fnv"
@@ -31,7 +32,6 @@ import (
 
 var nbHeavyRequestsInflight int64 = 0
 var nbRequestsInflight int64 = 0
-var totalNbOfRequests uint64 = 0
 var shouldStop uint64 = 0
 
 const max_concurrent_goroutines = 256
@@ -39,8 +39,9 @@ const max_concurrent_goroutines = 256
 const heavyRequestDuration = time.Millisecond * 512
 const defaultUsername = "default"
 const (
-	okResponse         = "1"
-	badGatewayResponse = "]: cannot reach 127.0.0.1:"
+	okResponse           = "1"
+	badGatewayResponse   = "]: cannot reach 127.0.0.1:"
+	gzippedErrorResponse = "Code: 62. DB::Exception: Syntax error"
 )
 const (
 	testCacheDir    = "./test-cache-data"
@@ -355,6 +356,72 @@ var fullWildcardedCfg = &config.Config{
 	},
 }
 
+func TestProxyConfigChanged(t *testing.T) {
+	pool := config.ConnectionPool{MaxIdleConns: 100, MaxIdleConnsPerHost: 2}
+	p := newReverseProxy(&pool)
+	assert.False(t, proxyConfigChanged(&pool, p), "same pool settings must not rebuild the proxy")
+
+	changed := pool
+	changed.MaxIdleConns = 50
+	assert.True(t, proxyConfigChanged(&changed, p), "changed max_idle_conns")
+
+	changed = pool
+	changed.MaxIdleConnsPerHost = 3
+	assert.True(t, proxyConfigChanged(&changed, p), "changed max_idle_conns_per_host")
+}
+
+func TestApplyConfig_FailedReloadKeepsRunningProxy(t *testing.T) {
+	saved := proxy
+	t.Cleanup(func() { proxy = saved })
+	proxy = nil
+
+	if err := applyConfig(goodCfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	running := proxy
+
+	// New pool settings send the reload down the path that builds a new proxy.
+	bad := *badCfg
+	bad.ConnectionPool = config.ConnectionPool{MaxIdleConns: 50, MaxIdleConnsPerHost: 3}
+	if err := applyConfig(&bad); err == nil {
+		t.Fatalf("error expected; got nil")
+	}
+
+	assert.Same(t, running, proxy, "a failed reload must leave the running proxy in place")
+	assert.NotEmpty(t, proxy.clusters, "the running proxy must keep its clusters")
+}
+
+// ClickHouse gzips error bodies for clients that accept gzip. Queries waiting on the failed
+// transaction get the reason as plain text, so it must not be stored compressed.
+func TestReverseProxy_GzippedErrorReachesAwaitingQueriesAsText(t *testing.T) {
+	cfg := *goodCfgWithCache
+	cfg.Caches = append([]config.Cache(nil), goodCfgWithCache.Caches...)
+	cfg.Caches[0].GraceTime = config.Duration(5 * time.Second)
+
+	stopAllRequestsInFlight()
+	proxy, err := getProxy(&cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	query := fmt.Sprintf("SELECT_gzipped_error_%d", time.Now().UnixNano())
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest("GET", fmt.Sprintf("%s/gzippedError?query=%s", fakeServer.URL, query), nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		return req
+	}
+
+	first := makeCustomRequest(proxy, newRequest())
+	first.Body.Close()
+	assert.Equal(t, http.StatusInternalServerError, first.StatusCode)
+	assert.Equal(t, "gzip", first.Header.Get("Content-Encoding"), "the first client gets the body as ClickHouse sent it")
+
+	awaiting := makeCustomRequest(proxy, newRequest())
+	b := bbToString(t, awaiting.Body)
+	awaiting.Body.Close()
+	assert.Equal(t, http.StatusInternalServerError, awaiting.StatusCode)
+	assert.Contains(t, b, failedTransactionPrefix+" "+gzippedErrorResponse)
+}
+
 func compareTransactionFailReason(t *testing.T, p *reverseProxy, user config.ClusterUser, query string, failReason string) {
 	h := fnv.New32a()
 	h.Write([]byte(user.Name + user.Password))
@@ -525,15 +592,19 @@ func TestReverseProxy_ServeHTTP1(t *testing.T) {
 			f: func(p *reverseProxy) *http.Response {
 				p.users[defaultUsername].maxConcurrentQueries = 1
 				p.users[defaultUsername].queueCh = make(chan struct{}, 1)
-				// we don't wait the requests to be handled by the fakeServer because one of them will be enqueued and not handled
-				// this is why we handle this part manually
-				nbRequest := atomic.LoadUint64(&totalNbOfRequests)
-				runHeavyRequestInGoroutine(p, 2, false)
-				counter := 0
-				for atomic.LoadUint64(&totalNbOfRequests) < nbRequest+2 && counter < 200 {
-					time.Sleep(1 * time.Millisecond)
-					counter++
+				// Every request passes through the queue, so the third one is only rejected while the first
+				// is running and the second is stuck in the queue. Start them one at a time to get there:
+				// otherwise the third can take the queue slot ahead of the second and run.
+				user := p.users[defaultUsername]
+				waitUntil := func(cond func() bool) {
+					for i := 0; i < 2000 && !cond(); i++ {
+						time.Sleep(time.Millisecond)
+					}
 				}
+				go makeHeavyRequest(p, heavyRequestDuration)
+				waitUntil(func() bool { return user.queryCounter.load() == 1 && len(user.queueCh) == 0 })
+				go makeHeavyRequest(p, heavyRequestDuration)
+				waitUntil(func() bool { return len(user.queueCh) == 1 })
 				return makeRequest(p)
 			},
 		},
@@ -1199,6 +1270,14 @@ var (
 			fmt.Fprintln(w, badGatewayResponse)
 			return
 		}
+		if r.URL.Path == "/gzippedError" {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusInternalServerError)
+			gw := gzip.NewWriter(w)
+			fmt.Fprint(gw, gzippedErrorResponse)
+			gw.Close()
+			return
+		}
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -1266,7 +1345,6 @@ func (tcn *testCloseNotifier) CloseNotify() <-chan bool {
 }
 
 func makeCustomRequest(p *reverseProxy, req *http.Request) *http.Response {
-	atomic.AddUint64(&totalNbOfRequests, 1)
 	rw := httptest.NewRecorder()
 	cn := &testCloseNotifier{rw}
 	p.ServeHTTP(cn, req)
