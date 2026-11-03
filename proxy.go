@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -78,7 +79,7 @@ func newReverseProxy(cfgCp *config.ConnectionPool) *reverseProxy {
 		},
 		reloadSignal:        make(chan struct{}),
 		reloadWG:            sync.WaitGroup{},
-		maxIdleConns:        cfgCp.MaxIdleConnsPerHost,
+		maxIdleConns:        cfgCp.MaxIdleConns,
 		maxIdleConnsPerHost: cfgCp.MaxIdleConnsPerHost,
 	}
 }
@@ -325,6 +326,7 @@ func (rp *reverseProxy) proxyRequest(s *scope, rw ResponseWriterWithCode, srw *s
 		return
 	case errors.Is(err, context.Canceled):
 		canceledRequest.With(s.labels).Inc()
+		s.clientClosed = true
 
 		q := getQuerySnippet(req)
 		log.Debugf("%s: remote client closed the connection in %s; query: %q", s, time.Since(startTime), q)
@@ -463,12 +465,12 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 		if contentLength > rp.maxErrorReasonSize {
 			log.Infof("%s: Error reason length (%d) is greater than max error reason size (%d)", s, contentLength, rp.maxErrorReasonSize)
 		} else {
-			errString, err := toString(reader)
+			errString, err := errorReasonText(reader, contentEncoding, rp.maxErrorReasonSize)
 			if err != nil {
 				log.Errorf("%s failed to get error reason: %s", s, err.Error())
+			} else {
+				errReason = fmt.Sprintf("%s %s", failedTransactionPrefix, errString)
 			}
-
-			errReason = fmt.Sprintf("%s %s", failedTransactionPrefix, errString)
 		}
 
 		rp.completeTransaction(s, statusCode, userCache, key, q, errReason)
@@ -577,6 +579,25 @@ func toString(stream io.Reader) (string, error) {
 	return bytes.NewBuffer(buf.Bytes()).String(), nil
 }
 
+// errorReasonText returns an error response body as text. Queries waiting on the failed transaction
+// receive it as a plain string with no Content-Encoding, so it can't be stored compressed. The result
+// is capped at maxSize, because the size check on the response only saw the compressed length.
+func errorReasonText(body io.Reader, contentEncoding string, maxSize int64) (string, error) {
+	switch contentEncoding {
+	case "", "identity":
+		return toString(body)
+	case "gzip":
+		gr, err := gzip.NewReader(body)
+		if err != nil {
+			return "", err
+		}
+		defer gr.Close()
+		return toString(io.LimitReader(gr, maxSize))
+	default:
+		return "", fmt.Errorf("cannot read error reason with content encoding %q", contentEncoding)
+	}
+}
+
 // clickhouseRecoverableStatusCodes set of recoverable http responses' status codes from Clickhouse.
 // When such happens we mark transaction as completed and let concurrent query to hit another Clickhouse shard.
 // possible http error codes in clickhouse (i.e: https://github.com/ClickHouse/ClickHouse/blob/master/src/Server/HTTPHandler.cpp)
@@ -586,8 +607,10 @@ func (rp *reverseProxy) completeTransaction(s *scope, statusCode int, userCache 
 	q []byte,
 	failReason string,
 ) {
-	// complete successful transactions or those with empty fail reason
-	if statusCode < 300 || failReason == "" {
+	// complete successful transactions or those with empty fail reason.
+	// A query cancelled because its client closed the connection did not fail:
+	// complete it too, so the concurrent queries that await it run the query themselves.
+	if statusCode < 300 || failReason == "" || s.clientClosed {
 		if err := userCache.Complete(key); err != nil {
 			log.Errorf("%s: %s; query: %q", s, err, q)
 		}

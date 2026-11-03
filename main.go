@@ -294,17 +294,31 @@ func loadConfig() (*config.Config, error) {
 // a configuration parameter value that is used in proxy initialization
 // changed
 func proxyConfigChanged(cfgCp *config.ConnectionPool, rp *reverseProxy) bool {
-	return cfgCp.MaxIdleConns != proxy.maxIdleConns ||
-		cfgCp.MaxIdleConnsPerHost != proxy.maxIdleConnsPerHost
+	return cfgCp.MaxIdleConns != rp.maxIdleConns ||
+		cfgCp.MaxIdleConnsPerHost != rp.maxIdleConnsPerHost
 }
 
 func applyConfig(cfg *config.Config) error {
-	if proxy == nil || proxyConfigChanged(&cfg.ConnectionPool, proxy) {
-		proxy = newReverseProxy(&cfg.ConnectionPool)
+	needNewProxy := proxy == nil || proxyConfigChanged(&cfg.ConnectionPool, proxy)
+
+	if needNewProxy {
+		newProxy := newReverseProxy(&cfg.ConnectionPool)
+		if err := newProxy.applyConfig(cfg); err != nil {
+			close(newProxy.reloadSignal)
+			newProxy.reloadWG.Wait()
+			return err
+		}
+		if proxy != nil {
+			close(proxy.reloadSignal)
+			proxy.reloadWG.Wait()
+		}
+		proxy = newProxy
+	} else {
+		if err := proxy.applyConfig(cfg); err != nil {
+			return err
+		}
 	}
-	if err := proxy.applyConfig(cfg); err != nil {
-		return err
-	}
+
 	allowedNetworksHTTP.Store(&cfg.Server.HTTP.AllowedNetworks)
 	allowedNetworksHTTPS.Store(&cfg.Server.HTTPS.AllowedNetworks)
 	allowedNetworksMetrics.Store(&cfg.Server.Metrics.AllowedNetworks)
